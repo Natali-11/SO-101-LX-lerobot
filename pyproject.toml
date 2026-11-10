@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Имя с подчёркиваниями и префиксом lerobot_robot_ — так LeRobot находит плагины.
+name = "lerobot_robot_so101_lx"
+version = "0.0.1"
+description = "SO-101 на сервоприводах LewanSoul LX для LeRobot"
+requires-python = ">=3.12"
+dependencies = ["pyserial>=3.5,<4.0"]
+
+[tool.setuptools]
+packages = ["lerobot_robot_so101_lx"]
