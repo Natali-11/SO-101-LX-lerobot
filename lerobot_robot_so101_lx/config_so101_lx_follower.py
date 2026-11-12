@@ -14,7 +14,7 @@ def _default_motor_ids() -> dict[str, int]:
         "shoulder_lift": 2,
         "elbow_flex": 3,
         "wrist_flex": 4,
-        "gripper": 5,
+        "wrist_roll": 5,
     }
 
 
