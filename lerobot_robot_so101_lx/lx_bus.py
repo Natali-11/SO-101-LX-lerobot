@@ -26,6 +26,10 @@ class LXBusError(RuntimeError):
     """Ошибка обмена с сервоприводами LX."""
 
 
+class _BadReply(Exception):
+    """Ответ мотора не пришёл целиком или испорчен; запрос будет повторён."""
+
+
 class LXBus:
     """Несколько сервоприводов LewanSoul LX на одном последовательном порту.
 
@@ -130,12 +134,40 @@ class LXBus:
             try:
                 # Выбросить остатки опоздавших ответов, чтобы не принять старый ответ за новый.
                 self._serial.reset_input_buffer()
+                if method == "get_position":
+                    return self._read_position_fast(motor_id)
                 return getattr(ctrl, method)(motor_id, self.timeout)
-            except (lx.TimeoutError, IndexError) as e:
+            except (lx.TimeoutError, IndexError, _BadReply) as e:
                 last_error = e
         raise LXBusError(
             f"Мотор '{motor}' (id={motor_id}) не ответил за {1 + self.num_retry} попыток."
         ) from last_error
+
+    def _read_position_fast(self, motor_id: int) -> int:
+        """Запросить позицию и прочитать ответ одним обращением к порту.
+
+        Библиотека читает ответ пятью кусочками и перед каждым меняет таймаут порта,
+        что в Windows заново настраивает порт. Позиция читается в каждом цикле
+        управления, поэтому здесь ответ известной длины (8 байт) читается целиком.
+        """
+        ser = self._serial
+        if ser.timeout != self.timeout:  # библиотека могла изменить таймаут
+            ser.timeout = self.timeout
+        length, command = 3, lx.SERVO_POS_READ
+        checksum = 255 - ((motor_id + length + command) % 256)
+        ser.write(bytes([0x55, 0x55, motor_id, length, command, checksum]))
+
+        reply = ser.read(8)  # 55 55 id 05 1C младший старший контрольная_сумма
+        if len(reply) != 8:
+            raise _BadReply(f"пришло {len(reply)} байт из 8")
+        header_ok = reply[0] == 0x55 and reply[1] == 0x55
+        fields_ok = reply[2] == motor_id and reply[3] == 5 and reply[4] == command
+        checksum_ok = reply[7] == 255 - (sum(reply[2:7]) % 256)
+        if not (header_ok and fields_ok and checksum_ok):
+            raise _BadReply(f"испорченный ответ: {list(reply)}")
+
+        position = reply[5] + reply[6] * 256
+        return position - 65536 if position > 32767 else position
 
     def ping(self, motor: str) -> bool:
         """True, если мотор отвечает на запрос позиции."""

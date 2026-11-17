@@ -27,6 +27,8 @@ from .lx_bus import DEGREES_PER_STEP, POSITION_MAX, POSITION_MIN, LXBus
 logger = logging.getLogger(__name__)
 
 GRIPPER = "gripper"
+# Губки захвата считаются неподвижными, если сдвинулись меньше чем на столько шагов за цикл.
+GRIPPER_STILL_STEPS = 3
 # Диапазон уже этого числа шагов (≈5°) считаем ошибкой калибровки: сустав не двигали.
 MIN_RANGE_STEPS = 20
 
@@ -47,6 +49,11 @@ class SO101LXFollower(Robot):
         self.cameras = make_cameras_from_configs(config.cameras)
         # Последние отправленные цели в шагах — для ограничения скорости.
         self._last_goal_raw: dict[str, int] = {}
+        # Последние прочитанные положения в шагах — для защиты захвата.
+        self._last_present_raw: dict[str, int] = {}
+        self._gripper_prev_present: int | None = None
+        self._gripper_still_since: float | None = None
+        self._gripper_squeeze_dir = 0  # 0 — защита не действует, ±1 — в какую сторону сжимает
 
     # ------------------------------------------------------------ описание
 
@@ -89,6 +96,10 @@ class SO101LXFollower(Robot):
     def configure(self) -> None:
         # Моторам LX перед работой ничего записывать не нужно.
         self._last_goal_raw = {}
+        self._last_present_raw = {}
+        self._gripper_prev_present = None
+        self._gripper_still_since = None
+        self._gripper_squeeze_dir = 0
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -197,6 +208,7 @@ class SO101LXFollower(Robot):
 
     def _read_normalized(self) -> dict[str, float]:
         raw = self.bus.read_positions()
+        self._remember_present(raw)
         return {motor: self._normalize(motor, pos) for motor, pos in raw.items()}
 
     # ------------------------------------------------------ работа в цикле
@@ -234,6 +246,8 @@ class SO101LXFollower(Robot):
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
 
         goal_raw = {motor: self._unnormalize(motor, val) for motor, val in goal_pos.items()}
+        if GRIPPER in goal_raw:
+            goal_raw[GRIPPER] = self._limit_gripper_squeeze(goal_raw[GRIPPER])
 
         # Для расчёта времени движения нужна точка отсчёта: до первой команды это текущее положение.
         missing = [motor for motor in goal_raw if motor not in self._last_goal_raw]
@@ -245,6 +259,39 @@ class SO101LXFollower(Robot):
             self._last_goal_raw[motor] = raw
 
         return {f"{motor}.pos": self._normalize(motor, raw) for motor, raw in goal_raw.items()}
+
+    def _remember_present(self, raw: dict[str, int]) -> None:
+        """Запомнить прочитанные положения и следить, двигаются ли губки захвата."""
+        self._last_present_raw.update(raw)
+        if GRIPPER not in raw:
+            return
+        present = raw[GRIPPER]
+        moved = self._gripper_prev_present is None or abs(present - self._gripper_prev_present) > GRIPPER_STILL_STEPS
+        if moved:
+            self._gripper_still_since = None
+        elif self._gripper_still_since is None:
+            self._gripper_still_since = time.monotonic()
+        self._gripper_prev_present = present
+
+    def _limit_gripper_squeeze(self, goal: int) -> int:
+        """Не давать захвату давить на предмет в полную силу (см. gripper_stall_time_s в конфиге)."""
+        cfg = self.config
+        present = self._last_present_raw.get(GRIPPER)
+        if cfg.gripper_stall_time_s is None or present is None:
+            return goal
+
+        error = goal - present
+        direction = (error > 0) - (error < 0)
+        if abs(error) <= cfg.gripper_stall_steps or direction != self._gripper_squeeze_dir:
+            self._gripper_squeeze_dir = 0  # захват открывают или цель близко — защита снята
+        if self._gripper_squeeze_dir == 0 and abs(error) > cfg.gripper_stall_steps:
+            stalled_for = 0.0 if self._gripper_still_since is None else time.monotonic() - self._gripper_still_since
+            if stalled_for >= cfg.gripper_stall_time_s:
+                self._gripper_squeeze_dir = direction
+                logger.info(f"{self}: захват упёрся (цель {goal}, положение {present}), усилие снижено.")
+        if self._gripper_squeeze_dir == 0:
+            return goal
+        return present + self._gripper_squeeze_dir * cfg.gripper_squeeze_steps
 
     def _move_time_ms(self, motor: str, goal_raw: int) -> int:
         """Время движения: не меньше move_time_ms и не быстрее max_speed_deg_s."""

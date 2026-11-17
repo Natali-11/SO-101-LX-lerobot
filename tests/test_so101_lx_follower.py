@@ -14,18 +14,24 @@ from test_lx_bus import FakeSerial  # noqa: E402
 import lerobot_robot_so101_lx.so101_lx_follower as robot_module  # noqa: E402
 from lerobot_robot_so101_lx import SO101LXFollower, SO101LXFollowerConfig  # noqa: E402
 
+# Тесты работают с компактной рукой из 5 моторов (захват — ID 5), чтобы не зависеть
+# от набора моторов по умолчанию; набор по умолчанию проверяется отдельно.
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "gripper"]
+MOTOR_IDS = {name: i for i, name in enumerate(JOINTS, start=1)}
+SO101_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
 
 @pytest.fixture
 def fake(monkeypatch):
-    port = FakeSerial({1: 500, 2: 500, 3: 500, 4: 500, 5: 300})
+    port = FakeSerial({1: 500, 2: 500, 3: 500, 4: 500, 5: 300, 6: 500})
     monkeypatch.setattr(serial, "Serial", lambda *args, **kwargs: port)
     return port
 
 
 def make_robot(tmp_path, **kwargs) -> SO101LXFollower:
-    config = SO101LXFollowerConfig(port="COM_TEST", id="test", calibration_dir=tmp_path, **kwargs)
+    config = SO101LXFollowerConfig(
+        port="COM_TEST", id="test", calibration_dir=tmp_path, motor_ids=dict(MOTOR_IDS), **kwargs
+    )
     return SO101LXFollower(config)
 
 
@@ -61,7 +67,9 @@ def sweep_joints(fake, monkeypatch, low=150, high=850):
 def test_features_and_factory(tmp_path, fake):
     robot = make_robot_from_config(SO101LXFollowerConfig(port="COM_TEST", id="t", calibration_dir=tmp_path))
     assert isinstance(robot, SO101LXFollower)
-    assert list(robot.action_features) == [f"{j}.pos" for j in JOINTS]
+    # По умолчанию — 6 моторов в порядке оригинальной SO-101, ID 1–6.
+    assert list(robot.action_features) == [f"{j}.pos" for j in SO101_JOINTS]
+    assert list(robot.bus.motors.values()) == [1, 2, 3, 4, 5, 6]
     assert robot.observation_features == robot.action_features
     assert not robot.is_calibrated and not robot.is_connected
 
@@ -72,7 +80,7 @@ def test_calibrate_saves_and_reloads(tmp_path, fake, monkeypatch):
     robot.connect(calibrate=False)
     fake.torque.update({i: True for i in fake.torque})
     robot.calibrate()
-    assert not any(fake.torque.values())  # калибровка отпускает моторы
+    assert not any(fake.torque[i] for i in MOTOR_IDS.values())  # калибровка отпускает моторы
     assert robot.is_calibrated
     assert robot.calibration["elbow_flex"].range_min == 150
     assert robot.calibration["elbow_flex"].range_max == 850
@@ -112,12 +120,12 @@ def test_send_action_clips_to_calibrated_range(tmp_path, fake):
     action = {"shoulder_pan.pos": 12.0, "shoulder_lift.pos": 500.0, "elbow_flex.pos": -500.0,
               "wrist_flex.pos": 0.0, "gripper.pos": 150.0}
     sent = robot.send_action(action)
-    assert fake.positions == {1: 550, 2: 800, 3: 200, 4: 500, 5: 600}
+    assert {i: fake.positions[i] for i in MOTOR_IDS.values()} == {1: 550, 2: 800, 3: 200, 4: 500, 5: 600}
     assert sent["shoulder_pan.pos"] == pytest.approx(12.0)
     assert sent["shoulder_lift.pos"] == pytest.approx(72.0)
     assert sent["elbow_flex.pos"] == pytest.approx(-72.0)
     assert sent["gripper.pos"] == pytest.approx(100.0)
-    assert all(fake.torque.values())
+    assert all(fake.torque[i] for i in MOTOR_IDS.values())
 
 
 def test_speed_limit_stretches_far_moves(tmp_path, fake):
@@ -150,6 +158,72 @@ def test_drive_mode_inverts_direction(tmp_path, fake):
     obs = robot.get_observation()
     assert obs["shoulder_pan.pos"] == pytest.approx(24.0)
     assert obs["gripper.pos"] == pytest.approx(100.0)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_gripper_stops_squeezing_when_blocked(tmp_path, fake, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(robot_module.time, "monotonic", clock)
+    robot = calibrated_robot(tmp_path)  # захват 300..600, сейчас на 300
+    robot.connect()
+
+    # Оператор закрывает захват до 100 %, губки доезжают до 420 и упираются в предмет.
+    robot.get_observation()
+    assert robot.send_action({"gripper.pos": 100.0})["gripper.pos"] == pytest.approx(100.0)
+    fake.positions[5] = 420
+    for _ in range(4):  # пока губки стоят меньше 0,5 с — команда прежняя, в полную силу
+        robot.get_observation()
+        robot.send_action({"gripper.pos": 100.0})
+        assert fake.positions[5] == 600
+        fake.positions[5] = 420
+        clock.now += 0.2
+
+    robot.get_observation()
+    robot.send_action({"gripper.pos": 100.0})
+    assert fake.positions[5] == 435  # цель подтянута к упору: 420 + 15 шагов
+    fake.positions[5] = 420
+
+    robot.get_observation()
+    robot.send_action({"gripper.pos": 100.0})
+    assert fake.positions[5] == 435  # пока держат «закрыть», давит слабо
+
+    # Оператор открывает захват — защита снимается сразу.
+    robot.get_observation()
+    robot.send_action({"gripper.pos": 0.0})
+    assert fake.positions[5] == 300
+
+
+def test_gripper_moving_freely_is_not_limited(tmp_path, fake, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(robot_module.time, "monotonic", clock)
+    robot = calibrated_robot(tmp_path)
+    robot.connect()
+    for pos in (330, 380, 430, 480, 530, 580):  # губки едут, хоть и отстают от цели
+        fake.positions[5] = pos
+        robot.get_observation()
+        robot.send_action({"gripper.pos": 100.0})
+        assert fake.positions[5] == 600
+        clock.now += 0.3
+
+
+def test_gripper_protection_can_be_disabled(tmp_path, fake, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(robot_module.time, "monotonic", clock)
+    robot = calibrated_robot(tmp_path, gripper_stall_time_s=None)
+    robot.connect()
+    for _ in range(5):
+        fake.positions[5] = 420
+        robot.get_observation()
+        robot.send_action({"gripper.pos": 100.0})
+        assert fake.positions[5] == 600
+        clock.now += 0.5
 
 
 def test_requires_calibration_and_connection(tmp_path, fake):

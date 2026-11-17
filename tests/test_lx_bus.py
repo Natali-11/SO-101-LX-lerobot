@@ -22,6 +22,7 @@ class FakeSerial:
         self.torque = {servo_id: False for servo_id in positions}
         self.move_times: dict[int, int] = {}
         self.drop_next = 0  # сколько ближайших запросов оставить без ответа
+        self.corrupt_next = 0  # сколько ближайших ответов о позиции испортить
         self.is_open = True
         self.timeout = None
         self._rx = b""
@@ -43,7 +44,11 @@ class FakeSerial:
                 return len(data)
             if command == POS_READ:
                 value = self.positions[servo_id] % 65536
-                self._rx += packet(servo_id, command, value % 256, value // 256)
+                reply = bytearray(packet(servo_id, command, value % 256, value // 256))
+                if self.corrupt_next > 0:
+                    self.corrupt_next -= 1
+                    reply[5] ^= 0x01  # помеха: испорчен один бит, контрольная сумма не сойдётся
+                self._rx += bytes(reply)
             elif command == VIN_READ:
                 self._rx += packet(servo_id, command, 7400 % 256, 7400 // 256)
             else:
@@ -112,6 +117,24 @@ def test_retry_recovers_from_lost_reply(fake):
     fake.drop_next = 3
     with pytest.raises(LXBusError):
         bus.read_position("a")
+
+
+def test_retry_recovers_from_corrupted_reply(fake):
+    bus = make_bus(num_retry=1)
+    bus.connect()
+    fake.corrupt_next = 1
+    assert bus.read_position("a") == 500
+    fake.corrupt_next = 2
+    with pytest.raises(LXBusError):
+        bus.read_position("a")
+
+
+def test_position_read_restores_port_timeout(fake):
+    bus = make_bus()
+    bus.connect()
+    bus.read_voltage("a")  # чтение через библиотеку меняет таймаут порта
+    assert bus.read_position("a") == 500
+    assert fake.timeout == 0.01
 
 
 def test_handshake_reports_missing_motor(fake):

@@ -2,7 +2,7 @@
 
 Примеры (из корня репозитория, в окружении conda `lerobot`):
     python scripts\\check_bus.py --port COM3
-    python scripts\\check_bus.py --port COM3 --ids 1 2 3 4 5 --write
+    python scripts\\check_bus.py --port COM3 --ids 1 2 3 4 5 6 --write
 
 Без --write скрипт только читает: моторы не двигаются и не включают удержание.
 С --write каждый цикл отправляет моторам их же текущую позицию: рука остаётся
@@ -17,7 +17,7 @@ import time
 
 from lerobot_robot_so101_lx import LXBus, LXBusError
 
-JOINTS_5 = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "gripper"]
+JOINTS_5 = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 JOINTS_6 = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
 
@@ -34,7 +34,7 @@ def report(title: str, durations: list[float], target_hz: float) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Проверка шины LX и замер частоты цикла")
     parser.add_argument("--port", required=True, help="порт, например COM3")
-    parser.add_argument("--ids", type=int, nargs="+", default=[1, 2, 3, 4, 5], help="ID моторов по порядку суставов")
+    parser.add_argument("--ids", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6], help="ID моторов по порядку суставов")
     parser.add_argument("--cycles", type=int, default=200, help="число циклов в каждом замере")
     parser.add_argument("--target-hz", type=float, default=30.0, help="нужная частота цикла")
     parser.add_argument("--write", action="store_true", help="замерить ещё и цикл чтение + запись")
